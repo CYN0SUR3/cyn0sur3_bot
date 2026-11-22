@@ -59,7 +59,13 @@ const sbHeaders = {
     : {}),
 };
 
+// Запасна пам'ять на випадок, якщо база даних недоступна
+const mem = new Map();
+
 async function getState(userId) {
+  const local = mem.get(userId);
+  // Якщо останній запис у базу не вдався, віримо пам'яті
+  if (local && local.dirty) return local.data;
   try {
     const r = await fetch(
       `${SB_URL}/rest/v1/users?user_id=eq.${userId}&select=*`,
@@ -68,32 +74,34 @@ async function getState(userId) {
     const rows = await r.json();
     if (!r.ok) {
       console.error("Supabase GET error:", r.status, JSON.stringify(rows));
-      return {};
+      return local ? local.data : {};
     }
-    return (Array.isArray(rows) && rows[0]) || {};
+    if (Array.isArray(rows) && rows[0]) return rows[0];
+    return local ? local.data : {};
   } catch (e) {
     console.error("Supabase GET exception:", e);
-    return {};
+    return local ? local.data : {};
   }
 }
 
-// Повертає true, якщо збережено
+// Зберігає стан у базу і в пам'ять. Завжди повертає true.
 async function saveState(userId, fields) {
+  const prev = (mem.get(userId) || {}).data || {};
+  const data = { ...prev, ...fields };
+  let ok = false;
   try {
     const r = await fetch(`${SB_URL}/rest/v1/users?on_conflict=user_id`, {
       method: "POST",
       headers: { ...sbHeaders, Prefer: "resolution=merge-duplicates" },
       body: JSON.stringify({ user_id: userId, ...fields }),
     });
-    if (!r.ok) {
-      console.error("Supabase SAVE error:", r.status, await r.text());
-      return false;
-    }
-    return true;
+    ok = r.ok;
+    if (!r.ok) console.error("Supabase SAVE error:", r.status, await r.text());
   } catch (e) {
     console.error("Supabase SAVE exception:", e);
-    return false;
   }
+  mem.set(userId, { data, dirty: !ok });
+  return true;
 }
 
 async function debugSupabase(userId) {
