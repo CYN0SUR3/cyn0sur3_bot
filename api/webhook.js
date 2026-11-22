@@ -85,7 +85,7 @@ async function getState(userId) {
   }
 }
 
-// Зберігає стан у базу і в пам'ять. Завжди повертає true.
+// Зберігає стан у базу і в пам'ять. Повертає true, якщо база прийняла запис.
 async function saveState(userId, fields) {
   const prev = (mem.get(userId) || {}).data || {};
   const data = { ...prev, ...fields };
@@ -102,7 +102,7 @@ async function saveState(userId, fields) {
     console.error("Supabase SAVE exception:", e);
   }
   mem.set(userId, { data, dirty: !ok });
-  return true;
+  return ok;
 }
 
 async function debugSupabase(userId) {
@@ -958,16 +958,16 @@ async function handleCallback(cq) {
       title: null,
       pack_name: null,
     });
-    if (!saved) {
-      return send(
-        chatId,
-        "⚠️ Не вдалося зберегти вибір у базі даних. Напиши /debug, щоб побачити причину."
-      );
-    }
-    return send(
+    await send(
       chatId,
       `Обрано: ${LABELS[`${kind}:${variant}`]} ✅\n\nТепер напиши назву набору (до 64 символів).`
     );
+    if (!saved) {
+      await send(
+        chatId,
+        "⚠️ База даних не відповідає, тому бот може «забути» твій вибір. Адміністратору: напиши /debug."
+      );
+    }
   }
 }
 
@@ -1172,7 +1172,17 @@ async function handleUpdate(update) {
     return handleMedia(msg, st);
   }
 
-  return send(chatId, "Спершу створи набір 👇", MAIN_MENU);
+  await send(chatId, "Спершу створи набір 👇", MAIN_MENU);
+  if (isAdmin) {
+    // Автоматична діагностика для адміністратора
+    await send(
+      chatId,
+      "🔧 Діагностика (бачиш лише ти).\nЩо бот пам'ятає про тебе: " +
+        JSON.stringify(st) +
+        "\n\n" +
+        (await debugSupabase(userId))
+    );
+  }
 }
 
 // ---------- Точка входу для Vercel ----------
