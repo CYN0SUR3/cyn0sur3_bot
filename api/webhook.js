@@ -296,10 +296,7 @@ const STICKER_TYPES = {
 const EMOJI_TYPES = {
   inline_keyboard: [
     [{ text: "🎨 Адаптивні (міняють колір)", callback_data: "t:emoji:adaptive" }],
-    [
-      { text: "😀 Звичайні", callback_data: "t:emoji:static" },
-      { text: "🎞 Анімовані", callback_data: "t:emoji:video" },
-    ],
+    [{ text: "😀 Звичайні (будь-які: картинки, анімація)", callback_data: "t:emoji:mixed" }],
   ],
 };
 
@@ -310,7 +307,7 @@ const LABELS = {
   "emoji:static": "звичайні емоджі",
   "emoji:adaptive": "адаптивні емоджі",
   "emoji:video": "анімовані емоджі",
-  "emoji:mixed": "змішані емоджі",
+  "emoji:mixed": "звичайні емоджі (будь-які)",
 };
 
 const WHAT_TO_SEND = {
@@ -323,17 +320,17 @@ const WHAT_TO_SEND = {
   "emoji:static":
     "Надсилай картинки. Вони стануть квадратними 100×100. Для прозорого фону надсилай як ФАЙЛ.",
   "emoji:adaptive":
-    "Надсилай прості однотонні іконки на прозорому фоні (як ФАЙЛ). Якщо фон непрозорий, темний малюнок на світлому фоні теж підійде. Колір підлаштується під текст сам.",
+    "Надсилай прості однотонні іконки на прозорому фоні (як ФАЙЛ). Якщо фон непрозорий, темний малюнок на світлому фоні теж підійде. Колір підлаштується під текст сам. Можна пересилати й готові нерухомі емоджі.",
   "emoji:video":
     "Надсилай відео або GIF. Береться перші 3 секунди, без звуку, розмір 100×100.",
   "emoji:mixed":
-    "Надсилай картинки або відео чи GIF (вони стануть емоджі 100×100), а також можна пересилати готові кастомні емоджі.",
+    "Надсилай що завгодно: картинки, відео, GIF, готові кастомні емоджі або звичайні наліпки (крім анімованих TGS). Усе стане емоджі 100×100.",
 };
 
 const HELP_TEXT =
   "Я роблю наліпки та кастомні емоджі 🙂\n\n" +
   "/newsticker — створити стікер-пак (анімовані, звичайні або змішані)\n" +
-  "/newemoji — створити набір емоджі (адаптивні, звичайні або анімовані)\n" +
+  "/newemoji — створити набір емоджі (адаптивні або звичайні)\n" +
   "/mypacks — мої набори (додати, перейменувати, видалити)\n" +
   "/clonepack — скопіювати старий набір, щоб його можна було редагувати\n" +
   "/done — завершити набір\n" +
@@ -555,21 +552,16 @@ async function importSticker(msg, st) {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const sk = msg.sticker;
+  const isEmojiPack = st.kind === "emoji";
 
   if (sk.type === "mask") {
     return send(chatId, "Маскові наліпки бот не підтримує 🙂");
   }
   const isCustomEmoji = sk.type === "custom_emoji";
-  if (st.kind === "sticker" && isCustomEmoji) {
+  if (!isEmojiPack && isCustomEmoji) {
     return send(
       chatId,
       "Це кастомне емоджі, а зараз створюється набір наліпок. Для емоджі створи окремий набір: /newemoji"
-    );
-  }
-  if (st.kind === "emoji" && !isCustomEmoji) {
-    return send(
-      chatId,
-      "У набір емоджі можна додати лише кастомні емоджі. Звичайну наліпку надішли як картинку, і я перетворю її на емоджі."
     );
   }
 
@@ -580,28 +572,49 @@ async function importSticker(msg, st) {
     ((v === "static" || v === "adaptive") && format === "static") ||
     (v === "video" && format !== "static");
   if (!ok) {
-    return send(
-      chatId,
-      format === "static"
-        ? "Ця наліпка звичайна, а набір анімований. Створи змішаний набір (/newsticker → Змішаний), щоб додавати будь-які."
-        : "Ця наліпка анімована, а набір звичайний. Створи змішаний набір (/newsticker → Змішаний), щоб додавати будь-які."
-    );
+    const hint = isEmojiPack
+      ? "Для будь-яких емоджі створи набір «Звичайні» (/newemoji)."
+      : "Створи змішаний набір (/newsticker → Змішаний), щоб додавати будь-які.";
+    const why =
+      v === "adaptive"
+        ? "В адаптивний набір можна додавати лише нерухомі зображення й емоджі."
+        : format === "static"
+        ? "Це нерухоме, а набір анімований."
+        : "Це анімоване, а набір для нерухомих.";
+    return send(chatId, `${why}\n${hint}`);
   }
 
   try {
-    const result = await uploadToSet(
-      userId,
-      st,
-      { fileId: sk.file_id },
-      sk.emoji || "😀",
-      format
-    );
+    // Наліпки й готові кастомні емоджі додаємо напряму за file_id.
+    // Звичайну наліпку для емоджі та неадаптивне емоджі для адаптивного набору перетворюємо.
+    const direct =
+      !isEmojiPack || (isCustomEmoji && (v !== "adaptive" || sk.needs_repainting));
+    let source = { fileId: sk.file_id };
+    let fmt = format;
+
+    if (!direct) {
+      if (format === "animated") {
+        return send(
+          chatId,
+          "Анімовані (TGS) наліпки не можна перетворити на емоджі. Надішли відео чи GIF або готове кастомне емоджі."
+        );
+      }
+      const buf = await downloadFile(sk.file_id);
+      source = await prepare(
+        buf,
+        "emoji",
+        format === "video" ? "video" : v === "adaptive" ? "adaptive" : "static"
+      );
+      fmt = format === "video" ? "video" : "static";
+    }
+
+    const result = await uploadToSet(userId, st, source, sk.emoji || "😀", fmt);
     if (!result.ok) {
       return send(chatId, `Не вийшло 😕\nПомилка Telegram: ${result.description}`);
     }
     return send(
       chatId,
-      `Наліпку додано ✅\n${setLink(st)}\n\nНадсилай ще або натисни /done, щоб завершити.`
+      `${isEmojiPack ? "Емоджі" : "Наліпку"} додано ✅\n${setLink(st)}\n\nНадсилай ще або натисни /done, щоб завершити.`
     );
   } catch (e) {
     console.error(e);
