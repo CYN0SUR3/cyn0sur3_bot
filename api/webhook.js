@@ -717,7 +717,7 @@ async function showMyPacks(chatId, userId) {
 
   const lines = alive.map((c, i) => {
     const label = LABELS[`${c.row.kind}:${c.row.variant}`] || "";
-    return `${i + 1}. ${c.set.title} — ${c.set.stickers.length} шт. ${label ? "(" + label + ")" : ""}`;
+    return `${i + 1}. ${c.set.title} — ${c.set.stickers.length} шт.${label ? " · " + label : ""}`;
   });
   const keyboard = {
     inline_keyboard: alive.map((c, i) => [
