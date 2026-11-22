@@ -52,8 +52,11 @@ async function downloadFile(fileId) {
 // ---------- Supabase ----------
 const sbHeaders = {
   apikey: SB_KEY,
-  Authorization: `Bearer ${SB_KEY}`,
   "Content-Type": "application/json",
+  // Старий ключ (eyJ...) це JWT і потребує Bearer. Новий (sb_secret_...) ні.
+  ...(SB_KEY && SB_KEY.startsWith("eyJ")
+    ? { Authorization: `Bearer ${SB_KEY}` }
+    : {}),
 };
 
 async function getState(userId) {
@@ -63,19 +66,73 @@ async function getState(userId) {
       { headers: sbHeaders }
     );
     const rows = await r.json();
+    if (!r.ok) {
+      console.error("Supabase GET error:", r.status, JSON.stringify(rows));
+      return {};
+    }
     return (Array.isArray(rows) && rows[0]) || {};
   } catch (e) {
+    console.error("Supabase GET exception:", e);
     return {};
   }
 }
 
+// Повертає true, якщо збережено
 async function saveState(userId, fields) {
-  const r = await fetch(`${SB_URL}/rest/v1/users?on_conflict=user_id`, {
-    method: "POST",
-    headers: { ...sbHeaders, Prefer: "resolution=merge-duplicates" },
-    body: JSON.stringify({ user_id: userId, ...fields }),
-  });
-  if (!r.ok) console.error("Supabase error:", await r.text());
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/users?on_conflict=user_id`, {
+      method: "POST",
+      headers: { ...sbHeaders, Prefer: "resolution=merge-duplicates" },
+      body: JSON.stringify({ user_id: userId, ...fields }),
+    });
+    if (!r.ok) {
+      console.error("Supabase SAVE error:", r.status, await r.text());
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error("Supabase SAVE exception:", e);
+    return false;
+  }
+}
+
+async function debugSupabase(userId) {
+  const keyType = !SB_KEY
+    ? "НЕМАЄ"
+    : SB_KEY.startsWith("eyJ")
+    ? "старий JWT-ключ"
+    : SB_KEY.startsWith("sb_secret_")
+    ? "новий secret-ключ"
+    : SB_KEY.startsWith("sb_publishable_")
+    ? "publishable (НЕ ПІДХОДИТЬ, потрібен secret/service_role)"
+    : "невідомий формат";
+  const lines = [
+    `SUPABASE_URL: ${SB_URL ? "є" : "НЕМАЄ"}`,
+    `SUPABASE_KEY: ${keyType}`,
+  ];
+
+  try {
+    const g = await fetch(
+      `${SB_URL}/rest/v1/users?user_id=eq.${userId}&select=*`,
+      { headers: sbHeaders }
+    );
+    lines.push(`Читання: ${g.status} ${(await g.text()).slice(0, 250)}`);
+  } catch (e) {
+    lines.push(`Читання: помилка з'єднання ${e.message}`);
+  }
+
+  try {
+    const w = await fetch(`${SB_URL}/rest/v1/users?on_conflict=user_id`, {
+      method: "POST",
+      headers: { ...sbHeaders, Prefer: "resolution=merge-duplicates" },
+      body: JSON.stringify({ user_id: userId }),
+    });
+    lines.push(`Запис: ${w.status} ${(await w.text()).slice(0, 250)}`);
+  } catch (e) {
+    lines.push(`Запис: помилка з'єднання ${e.message}`);
+  }
+
+  return lines.join("\n");
 }
 
 // ---------- Кнопки і тексти ----------
@@ -386,13 +443,19 @@ async function handleCallback(cq) {
   }
 
   if (a === "t" && LABELS[`${kind}:${variant}`]) {
-    await saveState(userId, {
+    const saved = await saveState(userId, {
       kind,
       variant,
       step: "title",
       title: null,
       pack_name: null,
     });
+    if (!saved) {
+      return send(
+        chatId,
+        "⚠️ Не вдалося зберегти вибір у базі даних. Напиши /debug, щоб побачити причину."
+      );
+    }
     return send(
       chatId,
       `Обрано: ${LABELS[`${kind}:${variant}`]} ✅\n\nТепер напиши назву набору (до 64 символів).`
@@ -422,6 +485,7 @@ async function handleUpdate(update) {
       );
     }
     if (cmd === "/help") return send(chatId, HELP_TEXT, MAIN_MENU);
+    if (cmd === "/debug") return send(chatId, await debugSupabase(userId));
     if (cmd === "/newsticker" || cmd === "/sticker") {
       return send(chatId, "Який стікер-пак створюємо?", STICKER_TYPES);
     }
@@ -457,7 +521,17 @@ async function handleUpdate(update) {
       return send(chatId, "Назва задовга, максимум 64 символи. Спробуй коротше.");
     }
     const packName = `p${Date.now().toString(36)}u${userId}_by_${BOT_USERNAME}`;
-    await saveState(userId, { title: text, pack_name: packName, step: "ready" });
+    const saved = await saveState(userId, {
+      title: text,
+      pack_name: packName,
+      step: "ready",
+    });
+    if (!saved) {
+      return send(
+        chatId,
+        "⚠️ Не вдалося зберегти назву у базі даних. Напиши /debug, щоб побачити причину."
+      );
+    }
     return send(
       chatId,
       `Назва: «${text}» ✅\n\n${WHAT_TO_SEND[`${st.kind}:${st.variant}`]}\n\n` +
@@ -470,7 +544,11 @@ async function handleUpdate(update) {
     return handleMedia(msg, st);
   }
 
-  return send(chatId, "Спершу створи набір 👇", MAIN_MENU);
+  return send(
+    chatId,
+    "Спершу створи набір 👇\n(якщо ти вже обирав тип, а бот не пам'ятає, напиши /debug)",
+    MAIN_MENU
+  );
 }
 
 // ---------- Точка входу для Vercel ----------
