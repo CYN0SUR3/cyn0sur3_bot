@@ -141,6 +141,15 @@ async function debugSupabase(userId) {
     lines.push(`Запис: помилка з'єднання ${e.message}`);
   }
 
+  try {
+    const a = await fetch(`${SB_URL}/rest/v1/allowed_users?select=user_id&limit=1`, {
+      headers: sbHeaders,
+    });
+    lines.push(`allowed_users: ${a.status} ${(await a.text()).slice(0, 250)}`);
+  } catch (e) {
+    lines.push(`allowed_users: помилка з'єднання ${e.message}`);
+  }
+
   return lines.join("\n");
 }
 
@@ -170,11 +179,13 @@ async function addAllowed(id) {
       headers: { ...sbHeaders, Prefer: "resolution=merge-duplicates" },
       body: JSON.stringify({ user_id: Number(id) }),
     });
-    if (!r.ok) console.error("allowed_users ADD error:", r.status, await r.text());
-    return r.ok;
+    if (r.ok) return { ok: true };
+    const t = await r.text();
+    console.error("allowed_users ADD error:", r.status, t);
+    return { ok: false, info: `${r.status} ${t.slice(0, 300)}` };
   } catch (e) {
     console.error("allowed_users ADD exception:", e);
-    return false;
+    return { ok: false, info: `помилка з'єднання: ${e.message}` };
   }
 }
 
@@ -184,11 +195,13 @@ async function removeAllowed(id) {
       method: "DELETE",
       headers: sbHeaders,
     });
-    if (!r.ok) console.error("allowed_users DEL error:", r.status, await r.text());
-    return r.ok;
+    if (r.ok) return { ok: true };
+    const t = await r.text();
+    console.error("allowed_users DEL error:", r.status, t);
+    return { ok: false, info: `${r.status} ${t.slice(0, 300)}` };
   } catch (e) {
     console.error("allowed_users DEL exception:", e);
-    return false;
+    return { ok: false, info: `помилка з'єднання: ${e.message}` };
   }
 }
 
@@ -206,11 +219,67 @@ async function listAllowed() {
   }
 }
 
+// ---------- Наявні набори (таблиця packs) ----------
+const makePackName = (ts, userId) => `p${ts}u${userId}_by_${BOT_USERNAME}`;
+const tsOf = (name) => ((name || "").match(/^p([0-9a-z]+)u\d+_by_/i) || [])[1];
+
+async function sbJson(path, opts = {}) {
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/${path}`, { headers: sbHeaders, ...opts });
+    if (!r.ok) {
+      console.error("Supabase error:", path, r.status, await r.text());
+      return null;
+    }
+    const t = await r.text();
+    return t ? JSON.parse(t) : [];
+  } catch (e) {
+    console.error("Supabase exception:", path, e);
+    return null;
+  }
+}
+
+async function recordPack(row) {
+  const res = await sbJson("packs?on_conflict=pack_name", {
+    method: "POST",
+    headers: { ...sbHeaders, Prefer: "resolution=merge-duplicates" },
+    body: JSON.stringify(row),
+  });
+  return res !== null;
+}
+
+const listPacks = (userId) =>
+  sbJson(`packs?user_id=eq.${userId}&select=*&order=created_at.desc&limit=10`);
+
+async function getPackRow(userId, name) {
+  const rows = await sbJson(
+    `packs?user_id=eq.${userId}&pack_name=eq.${encodeURIComponent(name)}&select=*`
+  );
+  return (rows && rows[0]) || null;
+}
+
+async function findCloneRow(userId, source) {
+  const rows = await sbJson(
+    `packs?user_id=eq.${userId}&source_set=eq.${encodeURIComponent(source)}&select=*&limit=1`
+  );
+  return (rows && rows[0]) || null;
+}
+
+const deletePackRow = (name) =>
+  sbJson(`packs?pack_name=eq.${encodeURIComponent(name)}`, { method: "DELETE" });
+
+const updatePackRow = (name, fields) =>
+  sbJson(`packs?pack_name=eq.${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    body: JSON.stringify(fields),
+  });
+
 // ---------- Кнопки і тексти ----------
 const MAIN_MENU = {
   inline_keyboard: [
     [{ text: "🖼 Створити стікер-пак", callback_data: "new:sticker" }],
     [{ text: "😀 Створити емоджі", callback_data: "new:emoji" }],
+    [{ text: "📚 Мої набори", callback_data: "my:list" }],
+    [{ text: "📥 Скопіювати старий набір", callback_data: "cl:start" }],
   ],
 };
 
@@ -241,6 +310,7 @@ const LABELS = {
   "emoji:static": "звичайні емоджі",
   "emoji:adaptive": "адаптивні емоджі",
   "emoji:video": "анімовані емоджі",
+  "emoji:mixed": "змішані емоджі",
 };
 
 const WHAT_TO_SEND = {
@@ -256,12 +326,16 @@ const WHAT_TO_SEND = {
     "Надсилай прості однотонні іконки на прозорому фоні (як ФАЙЛ). Якщо фон непрозорий, темний малюнок на світлому фоні теж підійде. Колір підлаштується під текст сам.",
   "emoji:video":
     "Надсилай відео або GIF. Береться перші 3 секунди, без звуку, розмір 100×100.",
+  "emoji:mixed":
+    "Надсилай картинки або відео чи GIF (вони стануть емоджі 100×100), а також можна пересилати готові кастомні емоджі.",
 };
 
 const HELP_TEXT =
   "Я роблю наліпки та кастомні емоджі 🙂\n\n" +
   "/newsticker — створити стікер-пак (анімовані, звичайні або змішані)\n" +
   "/newemoji — створити набір емоджі (адаптивні, звичайні або анімовані)\n" +
+  "/mypacks — мої набори (додати, перейменувати, видалити)\n" +
+  "/clonepack — скопіювати старий набір, щоб його можна було редагувати\n" +
   "/done — завершити набір\n" +
   "/cancel — скасувати\n" +
   "/id — дізнатись свій Telegram ID\n\n" +
@@ -431,11 +505,12 @@ function pickFile(msg, variant) {
 }
 
 // ---------- Завантаження в Telegram ----------
-async function uploadToSet(userId, st, file, emoji, variant) {
+// source: { buffer, mime, filename } для нового файлу або { fileId } для готової наліпки
+async function uploadToSet(userId, st, source, emoji, format) {
   const isEmoji = st.kind === "emoji";
   const inputSticker = {
-    sticker: "attach://file0",
-    format: variant === "video" ? "video" : "static",
+    sticker: source.fileId || "attach://file0",
+    format,
     emoji_list: [emoji],
   };
 
@@ -443,7 +518,9 @@ async function uploadToSet(userId, st, file, emoji, variant) {
     const f = new FormData();
     f.append("user_id", String(userId));
     f.append("name", st.pack_name);
-    f.append("file0", new Blob([file.buffer], { type: file.mime }), file.filename);
+    if (source.buffer) {
+      f.append("file0", new Blob([source.buffer], { type: source.mime }), source.filename);
+    }
     return f;
   };
 
@@ -458,7 +535,7 @@ async function uploadToSet(userId, st, file, emoji, variant) {
     f.append("title", st.title || "Мій набір");
     f.append("stickers", JSON.stringify([inputSticker]));
     if (isEmoji) f.append("sticker_type", "custom_emoji");
-    if (variant === "adaptive") f.append("needs_repainting", "true");
+    if (st.variant === "adaptive") f.append("needs_repainting", "true");
     return tgForm("createNewStickerSet", f);
   };
 
@@ -473,9 +550,70 @@ async function uploadToSet(userId, st, file, emoji, variant) {
   return res;
 }
 
+// Додавання готової наліпки (яку користувач переслав боту)
+async function importSticker(msg, st) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const sk = msg.sticker;
+
+  if (sk.type === "mask") {
+    return send(chatId, "Маскові наліпки бот не підтримує 🙂");
+  }
+  const isCustomEmoji = sk.type === "custom_emoji";
+  if (st.kind === "sticker" && isCustomEmoji) {
+    return send(
+      chatId,
+      "Це кастомне емоджі, а зараз створюється набір наліпок. Для емоджі створи окремий набір: /newemoji"
+    );
+  }
+  if (st.kind === "emoji" && !isCustomEmoji) {
+    return send(
+      chatId,
+      "У набір емоджі можна додати лише кастомні емоджі. Звичайну наліпку надішли як картинку, і я перетворю її на емоджі."
+    );
+  }
+
+  const format = sk.is_video ? "video" : sk.is_animated ? "animated" : "static";
+  const v = st.variant;
+  const ok =
+    v === "mixed" ||
+    ((v === "static" || v === "adaptive") && format === "static") ||
+    (v === "video" && format !== "static");
+  if (!ok) {
+    return send(
+      chatId,
+      format === "static"
+        ? "Ця наліпка звичайна, а набір анімований. Створи змішаний набір (/newsticker → Змішаний), щоб додавати будь-які."
+        : "Ця наліпка анімована, а набір звичайний. Створи змішаний набір (/newsticker → Змішаний), щоб додавати будь-які."
+    );
+  }
+
+  try {
+    const result = await uploadToSet(
+      userId,
+      st,
+      { fileId: sk.file_id },
+      sk.emoji || "😀",
+      format
+    );
+    if (!result.ok) {
+      return send(chatId, `Не вийшло 😕\nПомилка Telegram: ${result.description}`);
+    }
+    return send(
+      chatId,
+      `Наліпку додано ✅\n${setLink(st)}\n\nНадсилай ще або натисни /done, щоб завершити.`
+    );
+  } catch (e) {
+    console.error(e);
+    return send(chatId, `Не вийшло 😕\n${e.message}`);
+  }
+}
+
 async function handleMedia(msg, st) {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
+
+  if (msg.sticker) return importSticker(msg, st);
 
   const picked = pickFile(msg, st.variant);
   if (!picked) {
@@ -503,7 +641,13 @@ async function handleMedia(msg, st) {
   try {
     const buf = await downloadFile(f.file_id);
     const file = await prepare(buf, st.kind, variant);
-    const result = await uploadToSet(userId, st, file, emoji, variant);
+    const result = await uploadToSet(
+      userId,
+      st,
+      file,
+      emoji,
+      variant === "video" ? "video" : "static"
+    );
 
     if (!result.ok) {
       return send(chatId, `Не вийшло 😕\nПомилка Telegram: ${result.description}`);
@@ -519,11 +663,272 @@ async function handleMedia(msg, st) {
 }
 
 // ---------- Головна логіка ----------
+function packKeyboard(ts) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "➕ Додати", callback_data: `pa:${ts}` },
+        { text: "✏️ Перейменувати", callback_data: `pr:${ts}` },
+      ],
+      [
+        { text: "➖ Видалити елемент", callback_data: `px:${ts}` },
+        { text: "🗑 Видалити набір", callback_data: `pd:${ts}` },
+      ],
+      [{ text: "⬅️ До списку", callback_data: "my:list" }],
+    ],
+  };
+}
+
+async function showMyPacks(chatId, userId) {
+  const rows = await listPacks(userId);
+  if (rows === null) {
+    return send(
+      chatId,
+      "Не вдалося прочитати список 😕 Перевір, чи створена таблиця packs у Supabase."
+    );
+  }
+
+  const checked = await Promise.all(
+    rows.map(async (row) => {
+      const r = await tg("getStickerSet", { name: row.pack_name });
+      return { row, set: r.ok ? r.result : null, desc: r.description || "" };
+    })
+  );
+
+  const alive = [];
+  for (const c of checked) {
+    if (c.set) {
+      alive.push(c);
+    } else if (
+      /STICKERSET_INVALID|not found/i.test(c.desc) &&
+      Date.now() - new Date(c.row.created_at).getTime() > 24 * 3600 * 1000
+    ) {
+      await deletePackRow(c.row.pack_name); // набір давно видалений
+    }
+  }
+
+  if (!alive.length) {
+    return send(
+      chatId,
+      "У тебе ще немає наборів, створених через цього бота.",
+      MAIN_MENU
+    );
+  }
+
+  const lines = alive.map((c, i) => {
+    const label = LABELS[`${c.row.kind}:${c.row.variant}`] || "";
+    return `${i + 1}. ${c.set.title} — ${c.set.stickers.length} шт. ${label ? "(" + label + ")" : ""}`;
+  });
+  const keyboard = {
+    inline_keyboard: alive.map((c, i) => [
+      {
+        text: `${i + 1}. ${(c.set.title || "").slice(0, 30)}`,
+        callback_data: `pm:${tsOf(c.row.pack_name)}`,
+      },
+    ]),
+  };
+  return send(chatId, "📚 Твої набори:\n\n" + lines.join("\n") + "\n\nОбери набір, щоб ним керувати.", keyboard);
+}
+
+async function packAction(action, ts, chatId, userId) {
+  const name = makePackName(ts, userId);
+  const row = await getPackRow(userId, name);
+  if (!row) return send(chatId, "Набір не знайдено 🤷 Відкрий /mypacks ще раз.");
+  const link = setLink({ kind: row.kind, pack_name: name });
+
+  if (action === "pm") {
+    const r = await tg("getStickerSet", { name });
+    if (!r.ok) return send(chatId, "Цього набору вже немає в Telegram.");
+    return send(
+      chatId,
+      `«${r.result.title}» — ${r.result.stickers.length} шт.\n${link}`,
+      packKeyboard(ts)
+    );
+  }
+
+  if (action === "pa") {
+    const variant = row.variant || "mixed";
+    await saveState(userId, {
+      kind: row.kind,
+      variant,
+      title: row.title,
+      pack_name: name,
+      step: "ready",
+    });
+    return send(
+      chatId,
+      `Додаємо в «${row.title}» ✅\n\n` +
+        (WHAT_TO_SEND[`${row.kind}:${variant}`] ||
+          "Надсилай файли або пересилай готові наліпки.") +
+        "\n\nЩоб закінчити, натисни /done."
+    );
+  }
+
+  if (action === "pr") {
+    await saveState(userId, { kind: row.kind, title: row.title, pack_name: name, step: "rename" });
+    return send(chatId, `Напиши нову назву для «${row.title}» (до 64 символів).`);
+  }
+
+  if (action === "px") {
+    await saveState(userId, { kind: row.kind, title: row.title, pack_name: name, step: "remove" });
+    return send(
+      chatId,
+      `Перешли мені наліпку (або емоджі) з набору «${row.title}», яку треба видалити.\nЩоб закінчити, натисни /done.`
+    );
+  }
+
+  if (action === "pd") {
+    return send(chatId, `Точно видалити набір «${row.title}»? Це незворотно.`, {
+      inline_keyboard: [
+        [
+          { text: "Так, видалити", callback_data: `pdy:${ts}` },
+          { text: "Скасувати", callback_data: `pm:${ts}` },
+        ],
+      ],
+    });
+  }
+
+  if (action === "pdy") {
+    const res = await tg("deleteStickerSet", { name });
+    if (!res.ok) {
+      return send(chatId, `Не вийшло 😕\nПомилка Telegram: ${res.description}`);
+    }
+    await deletePackRow(name);
+    await saveState(userId, { step: null, pack_name: null });
+    return send(chatId, "Набір видалено 🗑", MAIN_MENU);
+  }
+}
+
+async function startClone(chatId, userId) {
+  await saveState(userId, { step: "clone" });
+  return send(
+    chatId,
+    "Надішли мені будь-яку наліпку (або кастомне емоджі) з набору, який хочеш скопіювати.\n\n" +
+      "Я зроблю його копію, яку зможу редагувати: додавати, видаляти, перейменовувати. " +
+      "Telegram не дозволяє ботам змінювати набори, створені не ними, тому потрібна копія. " +
+      "Користуйся цим для своїх наборів."
+  );
+}
+
+// Копіює весь набір в новий, який належить боту
+async function cloneSet(msg, st) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const sk = msg.sticker;
+
+  if (!sk.set_name) {
+    return send(
+      chatId,
+      "Ця наліпка не належить жодному набору. Надішли наліпку з набору, який хочеш скопіювати."
+    );
+  }
+  const srcRes = await tg("getStickerSet", { name: sk.set_name });
+  if (!srcRes.ok) {
+    return send(chatId, `Не вдалося відкрити набір 😕\n${srcRes.description}`);
+  }
+  const src = srcRes.result;
+  if (src.sticker_type === "mask") {
+    return send(chatId, "Маскові набори бот не підтримує 🙂");
+  }
+
+  const isEmoji = src.sticker_type === "custom_emoji";
+  const kind = isEmoji ? "emoji" : "sticker";
+  const items = src.stickers;
+  const toInput = (x) => ({
+    sticker: x.file_id,
+    format: x.is_video ? "video" : x.is_animated ? "animated" : "static",
+    emoji_list: [x.emoji || "😀"],
+  });
+
+  // Можливо, цей набір уже копіювали і треба продовжити
+  let name = null;
+  let title = null;
+  let i = 0;
+  const prev = await findCloneRow(userId, src.name);
+  if (prev) {
+    const cur = await tg("getStickerSet", { name: prev.pack_name });
+    if (cur.ok) {
+      name = prev.pack_name;
+      title = prev.title;
+      i = cur.result.stickers.length;
+    }
+  }
+  if (name && i >= items.length) {
+    return send(
+      chatId,
+      `Цей набір уже повністю скопійовано ✅\n${setLink({ kind, pack_name: name })}\n\n` +
+        "Щоб зробити нову копію, спершу видали стару в /mypacks."
+    );
+  }
+
+  await send(chatId, `⏳ Копіюю «${src.title}» (${items.length} шт.)...`);
+  const deadline = Date.now() + 45000;
+  let failed = 0;
+
+  if (!name) {
+    name = makePackName(Date.now().toString(36), userId);
+    title = `${src.title} (копія)`.slice(0, 64);
+    const body = {
+      user_id: userId,
+      name,
+      title,
+      stickers: [toInput(items[0])],
+      sticker_type: isEmoji ? "custom_emoji" : "regular",
+    };
+    if (isEmoji && items[0].needs_repainting) body.needs_repainting = true;
+    const created = await tg("createNewStickerSet", body);
+    if (!created.ok) {
+      return send(chatId, `Не вийшло 😕\nПомилка Telegram: ${created.description}`);
+    }
+    await recordPack({
+      pack_name: name,
+      user_id: userId,
+      title,
+      kind,
+      variant: "mixed",
+      source_set: src.name,
+    });
+    i = 1;
+  }
+
+  for (; i < items.length; i++) {
+    if (Date.now() > deadline) break;
+    const r = await tg("addStickerToSet", { user_id: userId, name, sticker: toInput(items[i]) });
+    if (!r.ok) {
+      failed++;
+      console.error("clone add failed:", r.description);
+    }
+  }
+
+  const link = setLink({ kind, pack_name: name });
+  if (i < items.length) {
+    return send(
+      chatId,
+      `Скопійовано ${i - failed} із ${items.length}, а далі не вистачило часу.\n${link}\n\n` +
+        "Надішли наліпку з того ж набору ще раз, щоб продовжити."
+    );
+  }
+
+  await saveState(userId, { kind, variant: "mixed", title, pack_name: name, step: "ready" });
+  return send(
+    chatId,
+    `Готово! ✅ Скопійовано ${items.length - failed} із ${items.length}.\n${link}\n\n` +
+      "Тепер можна додавати сюди нові наліпки або керувати набором через /mypacks." +
+      (failed ? `\n(${failed} не вдалося скопіювати)` : "")
+  );
+}
+
 async function handleCallback(cq) {
   await tg("answerCallbackQuery", { callback_query_id: cq.id });
   const chatId = cq.message.chat.id;
   const userId = cq.from.id;
   const [a, kind, variant] = (cq.data || "").split(":");
+
+  if (a === "my") return showMyPacks(chatId, userId);
+  if (a === "cl") return startClone(chatId, userId);
+  if (["pm", "pa", "pr", "px", "pd", "pdy"].includes(a)) {
+    return packAction(a, kind, chatId, userId);
+  }
 
   if (a === "new") {
     if (kind === "sticker") {
@@ -607,6 +1012,8 @@ async function handleUpdate(update) {
     if (cmd === "/newemoji" || cmd === "/emoji") {
       return send(chatId, "Які емоджі створюємо?", EMOJI_TYPES);
     }
+    if (cmd === "/mypacks" || cmd === "/mysets") return showMyPacks(chatId, userId);
+    if (cmd === "/clonepack") return startClone(chatId, userId);
     if (cmd === "/cancel") {
       await saveState(userId, { step: null });
       return send(chatId, "Скасовано. Щоб почати знову, натисни /start", MAIN_MENU);
@@ -654,20 +1061,20 @@ async function handleUpdate(update) {
       }
 
       if (cmd === "/adduser") {
-        const ok = await addAllowed(id);
-        if (!ok) {
-          return send(
-            chatId,
-            "Не вдалося записати в базу 😕 Перевір, чи створена таблиця allowed_users у Supabase."
-          );
+        const res = await addAllowed(id);
+        if (!res.ok) {
+          return send(chatId, `Не вдалося записати в базу 😕\nПричина: ${res.info}`);
         }
         // Повідомляємо людину (спрацює, якщо вона вже натискала Start у боті)
         await send(Number(id), "✅ Тобі відкрито доступ до бота. Натисни /start");
         return send(chatId, `Додано: ${id} ✅`);
       }
 
-      const ok = await removeAllowed(id);
-      return send(chatId, ok ? `Доступ забрано: ${id} ✅` : "Не вдалося видалити 😕");
+      const res = await removeAllowed(id);
+      return send(
+        chatId,
+        res.ok ? `Доступ забрано: ${id} ✅` : `Не вдалося видалити 😕\nПричина: ${res.info}`
+      );
     }
 
     return send(chatId, "Не знаю такої команди. Спробуй /help");
@@ -683,13 +1090,68 @@ async function handleUpdate(update) {
     if (text.length > 64) {
       return send(chatId, "Назва задовга, максимум 64 символи. Спробуй коротше.");
     }
-    const packName = `p${Date.now().toString(36)}u${userId}_by_${BOT_USERNAME}`;
+    const packName = makePackName(Date.now().toString(36), userId);
     await saveState(userId, { title: text, pack_name: packName, step: "ready" });
+    await recordPack({
+      pack_name: packName,
+      user_id: userId,
+      title: text,
+      kind: st.kind,
+      variant: st.variant,
+    });
     return send(
       chatId,
       `Назва: «${text}» ✅\n\n${WHAT_TO_SEND[`${st.kind}:${st.variant}`]}\n\n` +
-        "Щоб прив'язати своє емоджі, напиши його в підписі до файлу. Краще надсилай файли по одному."
+        "Щоб прив'язати своє емоджі, напиши його в підписі до файлу. Краще надсилай файли по одному." +
+        (st.kind === "sticker"
+          ? "\n\nМожна також переслати мені готові наліпки з інших наборів, і я додам їх сюди."
+          : "\n\nМожна також переслати готові кастомні емоджі, і я додам їх сюди.")
     );
+  }
+
+  // Перейменування набору
+  if (st.step === "rename") {
+    if (!text) return send(chatId, "Напиши нову назву текстом ✍️");
+    if (text.length > 64) {
+      return send(chatId, "Назва задовга, максимум 64 символи. Спробуй коротше.");
+    }
+    const res = await tg("setStickerSetTitle", { name: st.pack_name, title: text });
+    if (!res.ok) {
+      return send(chatId, `Не вийшло 😕\nПомилка Telegram: ${res.description}`);
+    }
+    await updatePackRow(st.pack_name, { title: text });
+    await saveState(userId, { step: null, title: text });
+    return send(chatId, `Готово ✅ Нова назва: «${text}»`, MAIN_MENU);
+  }
+
+  // Видалення елемента з набору
+  if (st.step === "remove") {
+    const sk = msg.sticker;
+    if (!sk) {
+      return send(
+        chatId,
+        "Перешли мені наліпку (або емоджі) з цього набору, яку треба видалити. Щоб закінчити, натисни /done."
+      );
+    }
+    if (sk.set_name !== st.pack_name) {
+      return send(chatId, "Ця наліпка з іншого набору. Перешли наліпку з вибраного набору.");
+    }
+    const res = await tg("deleteStickerFromSet", { sticker: sk.file_id });
+    if (!res.ok) {
+      return send(chatId, `Не вийшло 😕\nПомилка Telegram: ${res.description}`);
+    }
+    return send(chatId, "Видалено ✅ Пересилай ще або натисни /done.");
+  }
+
+  // Копіювання старого набору
+  if (st.step === "clone") {
+    if (!msg.sticker) {
+      return send(
+        chatId,
+        "Надішли саме наліпку (або кастомне емоджі) з набору, який треба скопіювати. Щоб скасувати, натисни /cancel."
+      );
+    }
+    return cloneSet(msg, st);
   }
 
   // Готові приймати файли
