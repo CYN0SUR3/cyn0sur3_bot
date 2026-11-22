@@ -12,6 +12,7 @@ const BOT_USERNAME = process.env.BOT_USERNAME;
 const SB_URL = process.env.SUPABASE_URL;
 const SB_KEY = process.env.SUPABASE_KEY;
 const SECRET = process.env.WEBHOOK_SECRET;
+const ADMIN_ID = String(process.env.ADMIN_ID || "").trim();
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
 const TRANSPARENT = { r: 0, g: 0, b: 0, alpha: 0 };
@@ -143,6 +144,68 @@ async function debugSupabase(userId) {
   return lines.join("\n");
 }
 
+// ---------- Список дозволених користувачів ----------
+async function isAllowed(userId) {
+  try {
+    const r = await fetch(
+      `${SB_URL}/rest/v1/allowed_users?user_id=eq.${userId}&select=user_id`,
+      { headers: sbHeaders }
+    );
+    const rows = await r.json();
+    if (!r.ok) {
+      console.error("allowed_users GET error:", r.status, JSON.stringify(rows));
+      return false;
+    }
+    return Array.isArray(rows) && rows.length > 0;
+  } catch (e) {
+    console.error("allowed_users GET exception:", e);
+    return false;
+  }
+}
+
+async function addAllowed(id) {
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/allowed_users?on_conflict=user_id`, {
+      method: "POST",
+      headers: { ...sbHeaders, Prefer: "resolution=merge-duplicates" },
+      body: JSON.stringify({ user_id: Number(id) }),
+    });
+    if (!r.ok) console.error("allowed_users ADD error:", r.status, await r.text());
+    return r.ok;
+  } catch (e) {
+    console.error("allowed_users ADD exception:", e);
+    return false;
+  }
+}
+
+async function removeAllowed(id) {
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/allowed_users?user_id=eq.${Number(id)}`, {
+      method: "DELETE",
+      headers: sbHeaders,
+    });
+    if (!r.ok) console.error("allowed_users DEL error:", r.status, await r.text());
+    return r.ok;
+  } catch (e) {
+    console.error("allowed_users DEL exception:", e);
+    return false;
+  }
+}
+
+async function listAllowed() {
+  try {
+    const r = await fetch(
+      `${SB_URL}/rest/v1/allowed_users?select=user_id&order=added_at.asc`,
+      { headers: sbHeaders }
+    );
+    const rows = await r.json();
+    if (!r.ok || !Array.isArray(rows)) return null;
+    return rows.map((x) => x.user_id);
+  } catch (e) {
+    return null;
+  }
+}
+
 // ---------- Кнопки і тексти ----------
 const MAIN_MENU = {
   inline_keyboard: [
@@ -157,6 +220,7 @@ const STICKER_TYPES = {
       { text: "🎞 Анімовані", callback_data: "t:sticker:video" },
       { text: "🖼 Звичайні", callback_data: "t:sticker:static" },
     ],
+    [{ text: "🔀 Змішаний (анімовані + звичайні)", callback_data: "t:sticker:mixed" }],
   ],
 };
 
@@ -173,6 +237,7 @@ const EMOJI_TYPES = {
 const LABELS = {
   "sticker:static": "звичайні наліпки",
   "sticker:video": "анімовані наліпки",
+  "sticker:mixed": "змішані наліпки (і анімовані, і звичайні)",
   "emoji:static": "звичайні емоджі",
   "emoji:adaptive": "адаптивні емоджі",
   "emoji:video": "анімовані емоджі",
@@ -183,6 +248,8 @@ const WHAT_TO_SEND = {
     "Надсилай картинки. Щоб фон був прозорим, надсилай їх як ФАЙЛ (скріпка → Файл).",
   "sticker:video":
     "Надсилай відео або GIF. Береться перші 3 секунди, без звуку.",
+  "sticker:mixed":
+    "Надсилай що завгодно: картинки стануть звичайними наліпками, а відео чи GIF анімованими (перші 3 секунди). Усе потрапить в один набір.",
   "emoji:static":
     "Надсилай картинки. Вони стануть квадратними 100×100. Для прозорого фону надсилай як ФАЙЛ.",
   "emoji:adaptive":
@@ -193,10 +260,11 @@ const WHAT_TO_SEND = {
 
 const HELP_TEXT =
   "Я роблю наліпки та кастомні емоджі 🙂\n\n" +
-  "/newsticker — створити стікер-пак (анімовані або звичайні)\n" +
+  "/newsticker — створити стікер-пак (анімовані, звичайні або змішані)\n" +
   "/newemoji — створити набір емоджі (адаптивні, звичайні або анімовані)\n" +
   "/done — завершити набір\n" +
-  "/cancel — скасувати\n\n" +
+  "/cancel — скасувати\n" +
+  "/id — дізнатись свій Telegram ID\n\n" +
   "Як це працює: обираєш тип, пишеш назву набору, а потім надсилаєш картинки чи відео. Кожен файл додається в набір.\n\n" +
   "Щоб прив'язати до наліпки своє емоджі, напиши його в підписі до файлу (за замовчуванням 😀).";
 
@@ -337,28 +405,37 @@ async function prepare(buf, kind, variant) {
 }
 
 // ---------- Пошук файлу в повідомленні ----------
+// Повертає { file, variant }, де variant це те, як саме обробляти цей файл
 function pickFile(msg, variant) {
   const mime = msg.document?.mime_type || "";
-  if (variant === "video") {
-    if (msg.video) return msg.video;
-    if (msg.animation) return msg.animation;
-    if (msg.video_note) return msg.video_note;
-    if (msg.document && (mime.startsWith("video/") || mime === "image/gif")) {
-      return msg.document;
-    }
+  const video =
+    msg.video ||
+    msg.animation ||
+    msg.video_note ||
+    (msg.document && (mime.startsWith("video/") || mime === "image/gif")
+      ? msg.document
+      : null);
+  const image = msg.photo
+    ? msg.photo[msg.photo.length - 1]
+    : msg.document && mime.startsWith("image/")
+    ? msg.document
+    : null;
+
+  if (variant === "video") return video ? { file: video, variant: "video" } : null;
+  if (variant === "mixed") {
+    if (video) return { file: video, variant: "video" };
+    if (image) return { file: image, variant: "static" };
     return null;
   }
-  if (msg.photo) return msg.photo[msg.photo.length - 1];
-  if (msg.document && mime.startsWith("image/")) return msg.document;
-  return null;
+  return image ? { file: image, variant } : null;
 }
 
 // ---------- Завантаження в Telegram ----------
-async function uploadToSet(userId, st, file, emoji) {
+async function uploadToSet(userId, st, file, emoji, variant) {
   const isEmoji = st.kind === "emoji";
   const inputSticker = {
     sticker: "attach://file0",
-    format: st.variant === "video" ? "video" : "static",
+    format: variant === "video" ? "video" : "static",
     emoji_list: [emoji],
   };
 
@@ -381,7 +458,7 @@ async function uploadToSet(userId, st, file, emoji) {
     f.append("title", st.title || "Мій набір");
     f.append("stickers", JSON.stringify([inputSticker]));
     if (isEmoji) f.append("sticker_type", "custom_emoji");
-    if (st.variant === "adaptive") f.append("needs_repainting", "true");
+    if (variant === "adaptive") f.append("needs_repainting", "true");
     return tgForm("createNewStickerSet", f);
   };
 
@@ -400,15 +477,20 @@ async function handleMedia(msg, st) {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
-  const f = pickFile(msg, st.variant);
-  if (!f) {
+  const picked = pickFile(msg, st.variant);
+  if (!picked) {
     return send(
       chatId,
       st.variant === "video"
         ? "Для анімованих потрібне відео або GIF 🎞"
+        : st.variant === "mixed"
+        ? "Надішли картинку, відео або GIF 🖼🎞"
         : "Надішли картинку 🖼 (краще як файл, щоб зберегти прозорість)."
     );
   }
+  const f = picked.file;
+  const variant = picked.variant;
+
   if (f.file_size && f.file_size > 20 * 1024 * 1024) {
     return send(chatId, "Файл завеликий: Telegram дозволяє боту брати до 20 МБ 😕");
   }
@@ -416,12 +498,12 @@ async function handleMedia(msg, st) {
   const found = (msg.caption || "").match(/\p{Extended_Pictographic}/u);
   const emoji = found ? found[0] : "😀";
 
-  if (st.variant === "video") await send(chatId, "⏳ Обробляю відео...");
+  if (variant === "video") await send(chatId, "⏳ Обробляю відео...");
 
   try {
     const buf = await downloadFile(f.file_id);
-    const file = await prepare(buf, st.kind, st.variant);
-    const result = await uploadToSet(userId, st, file, emoji);
+    const file = await prepare(buf, st.kind, variant);
+    const result = await uploadToSet(userId, st, file, emoji, variant);
 
     if (!result.ok) {
       return send(chatId, `Не вийшло 😕\nПомилка Telegram: ${result.description}`);
@@ -471,20 +553,44 @@ async function handleCallback(cq) {
   }
 }
 
-async function handleUpdate(update) {
-  if (update.callback_query) return handleCallback(update.callback_query);
+const ADMIN_HELP =
+  "\n\nКоманди адміністратора:\n" +
+  "/adduser 123456789 — дати доступ людині\n" +
+  "/removeuser 123456789 — забрати доступ\n" +
+  "/users — список людей з доступом\n" +
+  "/debug — перевірка бази даних";
 
+async function handleUpdate(update) {
+  const cq = update.callback_query;
   const msg = update.message;
+  const from = cq ? cq.from : msg && msg.from;
+  if (!from) return;
+
+  const userId = from.id;
+  const chatId = cq ? cq.message.chat.id : msg.chat.id;
+  const isAdmin = ADMIN_ID !== "" && String(userId) === ADMIN_ID;
+  const text = msg ? (msg.text || "").trim() : "";
+  const cmd = text.startsWith("/") ? text.split(/[\s@]/)[0].toLowerCase() : "";
+
+  // /id працює для всіх: так людина дізнається свій ID
+  if (cmd === "/id") return send(chatId, `Твій Telegram ID: ${userId}`);
+
+  // Перевірка доступу
+  if (!isAdmin && !(await isAllowed(userId))) {
+    if (cq) await tg("answerCallbackQuery", { callback_query_id: cq.id });
+    return send(
+      chatId,
+      "🔒 Цей бот приватний.\n\n" +
+        `Твій ID: ${userId}\n` +
+        "Надішли його адміністратору, щоб отримати доступ."
+    );
+  }
+
+  if (cq) return handleCallback(cq);
   if (!msg) return;
 
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const text = (msg.text || "").trim();
-
   // Команди
-  if (text.startsWith("/")) {
-    const cmd = text.split(/[\s@]/)[0].toLowerCase();
-
+  if (cmd) {
     if (cmd === "/start") {
       return send(
         chatId,
@@ -492,8 +598,9 @@ async function handleUpdate(update) {
         MAIN_MENU
       );
     }
-    if (cmd === "/help") return send(chatId, HELP_TEXT, MAIN_MENU);
-    if (cmd === "/debug") return send(chatId, await debugSupabase(userId));
+    if (cmd === "/help") {
+      return send(chatId, HELP_TEXT + (isAdmin ? ADMIN_HELP : ""), MAIN_MENU);
+    }
     if (cmd === "/newsticker" || cmd === "/sticker") {
       return send(chatId, "Який стікер-пак створюємо?", STICKER_TYPES);
     }
@@ -515,6 +622,54 @@ async function handleUpdate(update) {
       }
       return send(chatId, "Поки що нічого не створено. Почнемо?", MAIN_MENU);
     }
+
+    // Команди адміністратора
+    if (["/adduser", "/removeuser", "/users", "/debug"].includes(cmd)) {
+      if (!isAdmin) return send(chatId, "Ця команда лише для адміністратора.");
+
+      if (cmd === "/debug") return send(chatId, await debugSupabase(userId));
+
+      if (cmd === "/users") {
+        const ids = await listAllowed();
+        if (!ids) {
+          return send(
+            chatId,
+            "Не вдалося прочитати список. Перевір, чи створена таблиця allowed_users у Supabase."
+          );
+        }
+        return send(
+          chatId,
+          ids.length
+            ? `Люди з доступом (${ids.length}):\n` + ids.join("\n")
+            : "Список порожній. Ти (адміністратор) маєш доступ завжди."
+        );
+      }
+
+      const id = (text.split(/\s+/)[1] || "").trim();
+      if (!/^\d{5,15}$/.test(id)) {
+        return send(
+          chatId,
+          `Напиши так: ${cmd} 123456789\n(ID людина дізнається, надіславши боту /id)`
+        );
+      }
+
+      if (cmd === "/adduser") {
+        const ok = await addAllowed(id);
+        if (!ok) {
+          return send(
+            chatId,
+            "Не вдалося записати в базу 😕 Перевір, чи створена таблиця allowed_users у Supabase."
+          );
+        }
+        // Повідомляємо людину (спрацює, якщо вона вже натискала Start у боті)
+        await send(Number(id), "✅ Тобі відкрито доступ до бота. Натисни /start");
+        return send(chatId, `Додано: ${id} ✅`);
+      }
+
+      const ok = await removeAllowed(id);
+      return send(chatId, ok ? `Доступ забрано: ${id} ✅` : "Не вдалося видалити 😕");
+    }
+
     return send(chatId, "Не знаю такої команди. Спробуй /help");
   }
 
@@ -529,17 +684,7 @@ async function handleUpdate(update) {
       return send(chatId, "Назва задовга, максимум 64 символи. Спробуй коротше.");
     }
     const packName = `p${Date.now().toString(36)}u${userId}_by_${BOT_USERNAME}`;
-    const saved = await saveState(userId, {
-      title: text,
-      pack_name: packName,
-      step: "ready",
-    });
-    if (!saved) {
-      return send(
-        chatId,
-        "⚠️ Не вдалося зберегти назву у базі даних. Напиши /debug, щоб побачити причину."
-      );
-    }
+    await saveState(userId, { title: text, pack_name: packName, step: "ready" });
     return send(
       chatId,
       `Назва: «${text}» ✅\n\n${WHAT_TO_SEND[`${st.kind}:${st.variant}`]}\n\n` +
@@ -552,11 +697,7 @@ async function handleUpdate(update) {
     return handleMedia(msg, st);
   }
 
-  return send(
-    chatId,
-    "Спершу створи набір 👇\n(якщо ти вже обирав тип, а бот не пам'ятає, напиши /debug)",
-    MAIN_MENU
-  );
+  return send(chatId, "Спершу створи набір 👇", MAIN_MENU);
 }
 
 // ---------- Точка входу для Vercel ----------
