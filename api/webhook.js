@@ -296,7 +296,7 @@ const STICKER_TYPES = {
 const EMOJI_TYPES = {
   inline_keyboard: [
     [{ text: "🎨 Адаптивні (міняють колір)", callback_data: "t:emoji:adaptive" }],
-    [{ text: "😀 Звичайні (будь-які: картинки, анімація)", callback_data: "t:emoji:mixed" }],
+    [{ text: "😀 Звичайні", callback_data: "t:emoji:mixed" }],
   ],
 };
 
@@ -320,7 +320,7 @@ const WHAT_TO_SEND = {
   "emoji:static":
     "Надсилай картинки. Вони стануть квадратними 100×100. Для прозорого фону надсилай як ФАЙЛ.",
   "emoji:adaptive":
-    "Надсилай прості однотонні іконки на прозорому фоні (як ФАЙЛ). Якщо фон непрозорий, темний малюнок на світлому фоні теж підійде. Колір підлаштується під текст сам. Можна пересилати й готові нерухомі емоджі.",
+    "Надсилай що завгодно: фото, картинки, відео, GIF, готові наліпки чи емоджі. Усе стане однотонним силуетом, а колір підлаштується під текст. Найкраще виходять прості іконки на прозорому фоні (як ФАЙЛ). Якщо фон непрозорий, темні елементи залишаться, а світлі зникнуть.",
   "emoji:video":
     "Надсилай відео або GIF. Береться перші 3 секунди, без звуку, розмір 100×100.",
   "emoji:mixed":
@@ -329,7 +329,7 @@ const WHAT_TO_SEND = {
 
 const HELP_TEXT =
   "Я роблю наліпки та кастомні емоджі 🙂\n\n" +
-  "/newsticker — створити стікер-пак (анімовані, звичайні або змішані)\n" +
+  "/newsticker — створити стікер-пак (можна додавати картинки, відео, GIF і готові наліпки)\n" +
   "/newemoji — створити набір емоджі (адаптивні або звичайні)\n" +
   "/mypacks — мої набори (додати, перейменувати, видалити)\n" +
   "/clonepack — скопіювати старий набір, щоб його можна було редагувати\n" +
@@ -394,12 +394,58 @@ function getFfmpeg() {
   return dest;
 }
 
-async function toWebm(buf, isEmoji) {
+const WEBM_MAGIC = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]);
+const WHITE = "lutrgb=r=255:g=255:b=255";
+
+// Чи є прозорість у першому кадрі: true / false, або null, якщо не вдалося прочитати
+async function videoHasAlpha(ff, input, decoderArgs) {
+  try {
+    const { stdout } = await execFileP(
+      ff,
+      [
+        "-v", "error",
+        ...decoderArgs,
+        "-i", input,
+        "-frames:v", "1",
+        "-vf", "scale=64:64",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgba",
+        "pipe:1",
+      ],
+      { encoding: "buffer", timeout: 20000, maxBuffer: 10 * 1024 * 1024 }
+    );
+    for (let i = 3; i < stdout.length; i += 4) {
+      if (stdout[i] < 250) return true;
+    }
+    return stdout.length > 0 ? false : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// adaptive = true: перетворюємо відео на білий силует, колір підставить Telegram
+async function toWebm(buf, isEmoji, adaptive = false) {
   const ff = getFfmpeg();
   const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
   const input = path.join("/tmp", `in_${id}`);
   const output = path.join("/tmp", `out_${id}.webm`);
   fs.writeFileSync(input, buf);
+
+  // WEBM з прозорістю треба читати декодером libvpx
+  let decoderArgs = buf.subarray(0, 4).equals(WEBM_MAGIC) ? ["-c:v", "libvpx-vp9"] : [];
+
+  let silhouette = "";
+  if (adaptive) {
+    let hasAlpha = await videoHasAlpha(ff, input, decoderArgs);
+    if (hasAlpha === null && decoderArgs.length) {
+      decoderArgs = [];
+      hasAlpha = await videoHasAlpha(ff, input, decoderArgs);
+    }
+    silhouette = hasAlpha
+      ? `${WHITE},`
+      : // Немає прозорості: темні пікселі стають непрозорими
+        `split[a][b];[a]format=gray,negate[m];[b]${WHITE}[w];[w][m]alphamerge,format=rgba,`;
+  }
 
   const size = isEmoji
     ? "scale=100:100:force_original_aspect_ratio=decrease,pad=100:100:(ow-iw)/2:(oh-ih)/2:color=0x00000000"
@@ -413,25 +459,34 @@ async function toWebm(buf, isEmoji) {
     { crf: 58, fps: 20 },
   ];
 
+  const buildArgs = (a, dec) => [
+    "-y",
+    ...dec,
+    "-i", input,
+    "-t", "3",
+    "-an",
+    "-vf", `fps=${a.fps},format=rgba,${silhouette}${size}`,
+    "-c:v", "libvpx-vp9",
+    "-pix_fmt", "yuva420p",
+    "-b:v", "0",
+    "-crf", String(a.crf),
+    "-auto-alt-ref", "0",
+    "-row-mt", "1",
+    "-deadline", "good",
+    "-cpu-used", "4",
+    output,
+  ];
+  const opts = { timeout: 40000, maxBuffer: 20 * 1024 * 1024 };
+
   try {
     for (const a of attempts) {
-      const args = [
-        "-y",
-        "-i", input,
-        "-t", "3",
-        "-an",
-        "-vf", `fps=${a.fps},format=rgba,${size}`,
-        "-c:v", "libvpx-vp9",
-        "-pix_fmt", "yuva420p",
-        "-b:v", "0",
-        "-crf", String(a.crf),
-        "-auto-alt-ref", "0",
-        "-row-mt", "1",
-        "-deadline", "good",
-        "-cpu-used", "4",
-        output,
-      ];
-      await execFileP(ff, args, { timeout: 40000, maxBuffer: 20 * 1024 * 1024 });
+      try {
+        await execFileP(ff, buildArgs(a, decoderArgs), opts);
+      } catch (e) {
+        if (!decoderArgs.length) throw e;
+        decoderArgs = []; // можливо, це не VP9, пробуємо звичайний декодер
+        await execFileP(ff, buildArgs(a, decoderArgs), opts);
+      }
       const out = fs.readFileSync(output);
       if (out.length <= 256 * 1024) return out;
     }
@@ -444,9 +499,9 @@ async function toWebm(buf, isEmoji) {
 }
 
 async function prepare(buf, kind, variant) {
-  if (variant === "video") {
+  if (variant === "video" || variant === "adaptive_video") {
     return {
-      buffer: await toWebm(buf, kind === "emoji"),
+      buffer: await toWebm(buf, kind === "emoji", variant === "adaptive_video"),
       mime: "video/webm",
       filename: "sticker.webm",
     };
@@ -492,6 +547,11 @@ function pickFile(msg, variant) {
     ? msg.document
     : null;
 
+  if (variant === "adaptive") {
+    if (video) return { file: video, variant: "adaptive_video" };
+    if (image) return { file: image, variant: "adaptive" };
+    return null;
+  }
   if (variant === "video") return video ? { file: video, variant: "video" } : null;
   if (variant === "mixed") {
     if (video) return { file: video, variant: "video" };
@@ -569,7 +629,8 @@ async function importSticker(msg, st) {
   const v = st.variant;
   const ok =
     v === "mixed" ||
-    ((v === "static" || v === "adaptive") && format === "static") ||
+    v === "adaptive" ||
+    (v === "static" && format === "static") ||
     (v === "video" && format !== "static");
   if (!ok) {
     const hint = isEmojiPack
@@ -603,7 +664,13 @@ async function importSticker(msg, st) {
       source = await prepare(
         buf,
         "emoji",
-        format === "video" ? "video" : v === "adaptive" ? "adaptive" : "static"
+        format === "video"
+          ? v === "adaptive"
+            ? "adaptive_video"
+            : "video"
+          : v === "adaptive"
+          ? "adaptive"
+          : "static"
       );
       fmt = format === "video" ? "video" : "static";
     }
@@ -634,7 +701,7 @@ async function handleMedia(msg, st) {
       chatId,
       st.variant === "video"
         ? "Для анімованих потрібне відео або GIF 🎞"
-        : st.variant === "mixed"
+        : st.variant === "mixed" || st.variant === "adaptive"
         ? "Надішли картинку, відео або GIF 🖼🎞"
         : "Надішли картинку 🖼 (краще як файл, щоб зберегти прозорість)."
     );
@@ -649,7 +716,8 @@ async function handleMedia(msg, st) {
   const found = (msg.caption || "").match(/\p{Extended_Pictographic}/u);
   const emoji = found ? found[0] : "😀";
 
-  if (variant === "video") await send(chatId, "⏳ Обробляю відео...");
+  const isVid = variant === "video" || variant === "adaptive_video";
+  if (isVid) await send(chatId, "⏳ Обробляю відео...");
 
   try {
     const buf = await downloadFile(f.file_id);
@@ -659,7 +727,7 @@ async function handleMedia(msg, st) {
       st,
       file,
       emoji,
-      variant === "video" ? "video" : "static"
+      isVid ? "video" : "static"
     );
 
     if (!result.ok) {
@@ -944,30 +1012,35 @@ async function handleCallback(cq) {
   }
 
   if (a === "new") {
-    if (kind === "sticker") {
-      return send(chatId, "Який стікер-пак створюємо?", STICKER_TYPES);
-    }
+    if (kind === "sticker") return beginPack(chatId, userId, "sticker", "mixed");
     return send(chatId, "Які емоджі створюємо?", EMOJI_TYPES);
   }
 
   if (a === "t" && LABELS[`${kind}:${variant}`]) {
-    const saved = await saveState(userId, {
-      kind,
-      variant,
-      step: "title",
-      title: null,
-      pack_name: null,
-    });
+    return beginPack(chatId, userId, kind, variant);
+  }
+}
+
+async function beginPack(chatId, userId, kind, variant) {
+  const saved = await saveState(userId, {
+    kind,
+    variant,
+    step: "title",
+    title: null,
+    pack_name: null,
+  });
+  await send(
+    chatId,
+    (kind === "sticker"
+      ? "Створюємо стікер-пак ✅"
+      : `Обрано: ${LABELS[`${kind}:${variant}`]} ✅`) +
+      "\n\nТепер напиши назву набору (до 64 символів)."
+  );
+  if (!saved) {
     await send(
       chatId,
-      `Обрано: ${LABELS[`${kind}:${variant}`]} ✅\n\nТепер напиши назву набору (до 64 символів).`
+      "⚠️ База даних не відповідає, тому бот може «забути» твій вибір. Адміністратору: напиши /debug."
     );
-    if (!saved) {
-      await send(
-        chatId,
-        "⚠️ База даних не відповідає, тому бот може «забути» твій вибір. Адміністратору: напиши /debug."
-      );
-    }
   }
 }
 
@@ -1020,7 +1093,7 @@ async function handleUpdate(update) {
       return send(chatId, HELP_TEXT + (isAdmin ? ADMIN_HELP : ""), MAIN_MENU);
     }
     if (cmd === "/newsticker" || cmd === "/sticker") {
-      return send(chatId, "Який стікер-пак створюємо?", STICKER_TYPES);
+      return beginPack(chatId, userId, "sticker", "mixed");
     }
     if (cmd === "/newemoji" || cmd === "/emoji") {
       return send(chatId, "Які емоджі створюємо?", EMOJI_TYPES);
